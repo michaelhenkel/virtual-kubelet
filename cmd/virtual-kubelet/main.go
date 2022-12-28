@@ -41,6 +41,8 @@ func main() {
 	trace.T = opencensus.Adapter{}
 	traceConfig := opencensuscli.Config{}
 
+	db := cn2vk.NewDB()
+	uh := cn2vk.NewUpdateHandler()
 	o := opts.New()
 	o.Provider = "cn2"
 	o.Version = strings.Join([]string{k8sVersion, "vk-cn2", buildVersion}, "-")
@@ -48,7 +50,7 @@ func main() {
 		cli.WithBaseOpts(o),
 		cli.WithCLIVersion(buildVersion, buildTime),
 		cli.WithProvider("cn2", func(cfg provider.InitConfig) (provider.Provider, error) {
-			return cn2vk.NewProvider(cfg.NodeName, cfg.OperatingSystem, internalIP, cfg.ResourceManager, cfg.DaemonPort, cniPath, log.G(ctx))
+			return cn2vk.NewProvider(cfg.NodeName, cfg.OperatingSystem, internalIP, cfg.ResourceManager, cfg.DaemonPort, cniPath, log.G(ctx), db, uh)
 		}),
 		cli.WithPersistentFlags(logConfig.FlagSet()),
 		cli.WithPersistentPreRunCallback(func() error {
@@ -62,6 +64,9 @@ func main() {
 	if err != nil {
 		log.G(ctx).Fatal(err)
 	}
+
+	go db.Run()
+	go uh.Run()
 
 	if err := node.Run(ctx); err != nil {
 		log.G(ctx).Fatal(err)

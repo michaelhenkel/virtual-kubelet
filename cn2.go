@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/virtual-kubelet/node-cli/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
@@ -17,7 +19,149 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
+
+type UpdateHandler struct {
+	PodChan chan PodUpdate
+}
+
+type PodUpdate struct {
+	pod     *v1.Pod
+	counter int32
+	reply   chan string
+}
+
+func NewUpdateHandler() *UpdateHandler {
+	return &UpdateHandler{
+		PodChan: make(chan PodUpdate),
+	}
+}
+
+func (uh *UpdateHandler) Run() {
+	go func() {
+		for podUpdate := range uh.PodChan {
+			res, err := runCNI(podUpdate.pod.Name, podUpdate.pod.Namespace, podUpdate.counter)
+			if err != nil {
+				klog.Error(err)
+
+			}
+			klog.Info("handled ", podUpdate.counter)
+			podUpdate.reply <- res
+		}
+	}()
+}
+
+type Action string
+
+const (
+	Add  Action = "add"
+	Del  Action = "del"
+	Get  Action = "get"
+	List Action = "list"
+)
+
+type DB struct {
+	podStatus map[types.UID]string
+	podMap    map[types.NamespacedName]*v1.Pod
+	PodChan   chan struct {
+		types.NamespacedName
+		*v1.Pod
+		Action
+	}
+	Reply     chan *v1.Pod
+	ReplyList chan []*v1.Pod
+}
+
+func NewDB() *DB {
+	return &DB{
+		podStatus: make(map[types.UID]string),
+		podMap:    make(map[types.NamespacedName]*v1.Pod),
+		PodChan: make(chan struct {
+			types.NamespacedName
+			*v1.Pod
+			Action
+		}),
+		Reply:     make(chan *v1.Pod),
+		ReplyList: make(chan []*v1.Pod),
+	}
+}
+
+func (d *DB) Run() {
+	go func() {
+
+		for pod := range d.PodChan {
+			switch pod.Action {
+			case Add:
+				d.podMap[pod.NamespacedName] = pod.Pod
+			case Del:
+				delete(d.podMap, pod.NamespacedName)
+			case Get:
+				if pod, ok := d.podMap[pod.NamespacedName]; ok {
+					d.Reply <- pod
+				} else {
+					d.Reply <- nil
+				}
+			case List:
+				var podList []*v1.Pod
+				for _, pod := range d.podMap {
+					podList = append(podList, pod)
+				}
+				d.ReplyList <- podList
+			}
+		}
+
+	}()
+}
+
+func (d *DB) Add(pod *v1.Pod) {
+	d.PodChan <- struct {
+		types.NamespacedName
+		*v1.Pod
+		Action
+	}{
+		types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
+		pod,
+		Add,
+	}
+}
+
+func (d *DB) Del(pod *v1.Pod) {
+	d.PodChan <- struct {
+		types.NamespacedName
+		*v1.Pod
+		Action
+	}{
+		types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
+		pod,
+		Del,
+	}
+}
+func (d *DB) Get(namespace, name string) *v1.Pod {
+	d.PodChan <- struct {
+		types.NamespacedName
+		*v1.Pod
+		Action
+	}{
+		types.NamespacedName{Namespace: namespace, Name: name},
+		nil,
+		Get,
+	}
+	return <-d.Reply
+}
+
+func (d *DB) List() []*v1.Pod {
+	d.PodChan <- struct {
+		types.NamespacedName
+		*v1.Pod
+		Action
+	}{
+		types.NamespacedName{},
+		nil,
+		List,
+	}
+	return <-d.ReplyList
+}
 
 type Cni struct {
 	CniVersion string `json:"cniVersion"`
@@ -44,12 +188,18 @@ type Provider struct {
 	daemonEndpointPort int32
 	podStatus          map[types.UID]string
 	notifyStatus       func(*v1.Pod)
+	mut                sync.Mutex
 	podMap             map[types.NamespacedName]*v1.Pod
 	cniPath            string
 	logger             log.Logger
+	counter            int32
+	createCounter      int32
+	replyCounter       int32
+	db                 *DB
+	uh                 *UpdateHandler
 }
 
-func NewProvider(nodeName, operatingSystem string, internalIP string, resourceManager *manager.ResourceManager, daemonEndpointPort int32, cniPath string, logger log.Logger) (*Provider, error) {
+func NewProvider(nodeName, operatingSystem string, internalIP string, resourceManager *manager.ResourceManager, daemonEndpointPort int32, cniPath string, logger log.Logger, db *DB, uh *UpdateHandler) (*Provider, error) {
 
 	provider := Provider{
 		resourceManager:    resourceManager,
@@ -61,6 +211,12 @@ func NewProvider(nodeName, operatingSystem string, internalIP string, resourceMa
 		podMap:             make(map[types.NamespacedName]*v1.Pod),
 		cniPath:            cniPath,
 		logger:             logger,
+		mut:                sync.Mutex{},
+		counter:            0,
+		createCounter:      0,
+		replyCounter:       0,
+		db:                 db,
+		uh:                 uh,
 	}
 
 	p := &provider
@@ -69,9 +225,9 @@ func NewProvider(nodeName, operatingSystem string, internalIP string, resourceMa
 
 func (p *Provider) capacity(ctx context.Context) v1.ResourceList {
 	var cpuQ resource.Quantity
-	cpuQ.Set(int64(8))
+	cpuQ.Set(int64(80))
 	var memQ resource.Quantity
-	memQ.Set(int64(128))
+	memQ.Set(int64(15261268))
 
 	return v1.ResourceList{
 		"cpu":    cpuQ,
@@ -93,7 +249,10 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	pod.Status.Phase = v1.PodPending
 	pod.Generation = 1
 	pod.CreationTimestamp = metav1.Now()
-	p.podMap[types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}] = pod
+
+	p.db.Add(pod)
+
+	fmt.Printf("CREATED %d PODS\n", p.createCounter)
 	return nil
 }
 
@@ -103,19 +262,26 @@ var cniConf = `{
 	"type": "loopback"
 }`
 
-func (p *Provider) runCNI(podName, podNamespace string) (string, error) {
+func runCNI(podName, podNamespace string, id int32) (string, error) {
+
+	//ctx := context.Background()
+	var cancel context.CancelFunc
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(120)*time.Second)
+	defer cancel()
 
 	var i, o, e bytes.Buffer
-	i.Write([]byte(cniConf))
+	if _, err := i.Write([]byte(cniConf)); err != nil {
+		return e.String(), err
+	}
 
-	cmd := exec.Command(p.cniPath)
+	cmd := exec.CommandContext(ctx, "/tmp/cni")
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, "CNI_COMMAND=ADD")
 	cmd.Env = append(cmd.Env, "CNI_CONTAINERID=1")
 	cmd.Env = append(cmd.Env, "CNI_NETNS=1")
 	cmd.Env = append(cmd.Env, "CNI_IFNAME=eth1")
 	cmd.Env = append(cmd.Env, "CNI_PATH=/bin")
-	cmd.Env = append(cmd.Env, fmt.Sprintf("CNI_ARGS=K8S_POD_NAME=%s;K8S_POD_NAMESPACE=%s", podName, podNamespace))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("CNI_ARGS=K8S_POD_NAME=%s;K8S_POD_NAMESPACE=%s;ID=%d", podName, podNamespace, id))
 	cmd.Stdout = &o
 	cmd.Stdin = &i
 	cmd.Stderr = &e
@@ -128,12 +294,32 @@ func (p *Provider) runCNI(podName, podNamespace string) (string, error) {
 }
 
 func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
-	fmt.Println("POD UPDATE")
-	res, err := p.runCNI(pod.Name, pod.Namespace)
-	if err != nil {
-		p.logger.Error(err)
-		return err
+	//fmt.Println("POD UPDATE")
+
+	existingPod := p.db.Get(pod.Namespace, pod.Name)
+	if existingPod != nil && existingPod.Status.PodIP != "" {
+
+		return nil
 	}
+	p.mut.Lock()
+	p.counter = p.counter + 1
+	p.mut.Unlock()
+	fmt.Println("1 called cni ", p.counter)
+
+	var reply = make(chan string)
+	p.uh.PodChan <- PodUpdate{
+		pod:     pod,
+		counter: p.counter,
+		reply:   reply,
+	}
+
+	res := <-reply
+
+	p.mut.Lock()
+	p.replyCounter = p.replyCounter + 1
+	p.mut.Unlock()
+	fmt.Println("1 got cni replies", p.replyCounter)
+	//time.Sleep(time.Duration(time.Second * 2))
 
 	cni := &Cni{}
 	if err := json.Unmarshal([]byte(res), cni); err != nil {
@@ -175,16 +361,20 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 	startTime := metav1.Now()
 	pod.Status.StartTime = &startTime
 	pod.Status.ContainerStatuses = containerStatusList
-	p.podMap[types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}] = pod
+	//fmt.Println("Pod/ip: ", pod.Name, v4ip)
+	p.db.Add(pod)
+	fmt.Println("2 got cni replies", p.replyCounter)
+
+	fmt.Println("pods:", len(p.db.List()))
 	return nil
 }
 func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
-	delete(p.podMap, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace})
+	p.db.Del(pod)
 	return nil
 }
 func (p *Provider) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
-
-	return p.podMap[types.NamespacedName{Name: name, Namespace: namespace}], nil
+	m := p.db.Get(namespace, name)
+	return m, nil
 }
 
 func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
@@ -192,14 +382,17 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 }
 
 func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
-	return &p.podMap[types.NamespacedName{Name: name, Namespace: namespace}].Status, nil
+	p.mut.Lock()
+	defer p.mut.Unlock()
+	pod := p.db.Get(namespace, name)
+	if pod != nil {
+		return &pod.Status, nil
+	}
+	return nil, nil
 }
 
 func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
-	var podList []*v1.Pod
-	for _, pod := range p.podMap {
-		podList = append(podList, pod)
-	}
+	podList := p.db.List()
 	return podList, nil
 }
 
